@@ -6,7 +6,13 @@ from typing import Annotated
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from asr_core import ASRConfigOptions, OfflineASRClient, RivaTranscriptionError
+from asr_core import (
+    ASRConfigOptions,
+    OfflineASRClient,
+    RivaTranscriptionError,
+    merge_transcription_results,
+    split_pcm_by_size,
+)
 from audio_decode import AudioDecodeError, decode_to_pcm_s16le
 
 
@@ -99,8 +105,23 @@ async def create_transcription(
         word_time_offsets=wants_verbose or _wants_word_timestamps(timestamp_granularities),
     )
 
+    max_chunk_mb = float(os.getenv("ASR_MAX_CHUNK_MB", "50"))
+    max_chunk_bytes = int(max_chunk_mb * 1024 * 1024)
+    max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
+
+    chunks, offsets = split_pcm_by_size(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, max_chunk_bytes)
+
     try:
-        result = client.transcribe_bytes(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, config_options)
+        partial_results = [
+            client.transcribe_vad_packed(
+                chunk,
+                decoded_audio.sample_rate_hz,
+                config_options,
+                max_vad_segment_seconds=max_vad_segment_seconds,
+            )
+            for chunk in chunks
+        ]
+        result = merge_transcription_results(partial_results, offsets)
     except RivaTranscriptionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

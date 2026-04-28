@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,6 +54,19 @@ class TranscriptionResult:
     words: list[WordTimestamp]
     segments: list[Segment]
     raw_response: Any
+
+
+@dataclass
+class VADChunk:
+    start_sample: int
+    end_sample: int
+
+
+@dataclass
+class PackedPlacement:
+    original_start: float
+    packed_start: float
+    duration: float
 
 
 class RivaTranscriptionError(RuntimeError):
@@ -138,71 +152,316 @@ class OfflineASRClient:
         except grpc.RpcError as exc:
             raise RivaTranscriptionError(exc.details()) from exc
 
-        words: list[WordTimestamp] = []
-        segments: list[Segment] = []
-        text_parts: list[str] = []
+        return _response_to_transcription(response, config_options.language_code)
 
-        previous_segment_end = 0.0
-        for index, result in enumerate(getattr(response, "results", [])):
-            if not getattr(result, "alternatives", None):
-                continue
-            alternative = result.alternatives[0]
-            transcript = alternative.transcript.strip()
-            if transcript:
-                text_parts.append(transcript)
+    def transcribe_vad_packed(
+        self,
+        audio_bytes: bytes,
+        sample_rate_hz: int,
+        config_options: ASRConfigOptions,
+        *,
+        max_vad_segment_seconds: float = 10.0,
+    ) -> TranscriptionResult:
+        segments = _vad_segments(audio_bytes, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+        mapped_words: list[WordTimestamp] = []
+        mapped_segments: list[Segment] = []
+        segment_id = 0
 
-            segment_words: list[WordTimestamp] = []
-            for word_info in getattr(alternative, "words", []):
-                word = WordTimestamp(
-                    word=getattr(word_info, "word", ""),
-                    start=_normalize_time(getattr(word_info, "start_time", None)),
-                    end=_normalize_time(getattr(word_info, "end_time", None)),
-                    speaker=_speaker_label(getattr(word_info, "speaker_tag", None)),
-                )
-                words.append(word)
-                segment_words.append(word)
+        for idx in range(0, len(segments), 2):
+            pair = segments[idx : idx + 2]
+            packed_audio, placements = _build_packed_audio(audio_bytes, sample_rate_hz, pair)
+            packed_result = self.transcribe_bytes(packed_audio, sample_rate_hz, config_options)
 
-            processed_end = _normalize_audio_processed(getattr(result, "audio_processed", None))
-            word_start = segment_words[0].start if segment_words else None
-            word_end = segment_words[-1].end if segment_words else None
+            for word in packed_result.words:
+                mapped = _map_word(word, placements)
+                if mapped:
+                    mapped_words.append(mapped)
 
-            segment_start = previous_segment_end
-            if word_start is not None:
-                segment_start = max(previous_segment_end, min(word_start, processed_end if processed_end is not None else word_start))
+            for seg in packed_result.segments:
+                mapped = _map_segment(seg, placements)
+                if not mapped or not mapped.text:
+                    continue
+                mapped.id = segment_id
+                mapped_segments.append(mapped)
+                segment_id += 1
 
-            segment_end = processed_end
-            if segment_end is None:
-                segment_end = word_end
-            elif word_end is not None:
-                segment_end = max(segment_start, max(word_end, processed_end))
-
-            if segment_end is None:
-                segment_end = segment_start
-
-            segments.append(
-                Segment(
-                    id=index,
-                    start=segment_start,
-                    end=segment_end,
-                    text=transcript,
-                )
-            )
-            previous_segment_end = segment_end
+        mapped_words.sort(key=lambda w: ((w.start or 0.0), (w.end or w.start or 0.0)))
+        mapped_segments.sort(key=lambda s: ((s.start or 0.0), (s.end or s.start or 0.0)))
 
         duration = None
-        if words and words[-1].end is not None:
-            duration = words[-1].end
-        elif segments and segments[-1].end is not None:
-            duration = segments[-1].end
+        if mapped_words and mapped_words[-1].end is not None:
+            duration = mapped_words[-1].end
+        elif mapped_segments and mapped_segments[-1].end is not None:
+            duration = mapped_segments[-1].end
 
         return TranscriptionResult(
-            text=" ".join(part for part in text_parts if part).strip(),
+            text=" ".join(seg.text for seg in mapped_segments if seg.text).strip(),
             language=config_options.language_code,
             duration=duration,
-            words=words,
-            segments=segments,
-            raw_response=response,
+            words=mapped_words,
+            segments=mapped_segments,
+            raw_response={"mode": "vad_packed", "segment_count": len(segments)},
         )
+
+
+def _response_to_transcription(response: Any, language_code: str | None) -> TranscriptionResult:
+    words: list[WordTimestamp] = []
+    segments: list[Segment] = []
+    text_parts: list[str] = []
+
+    previous_segment_end = 0.0
+    for index, result in enumerate(getattr(response, "results", [])):
+        if not getattr(result, "alternatives", None):
+            continue
+        alternative = result.alternatives[0]
+        transcript = alternative.transcript.strip()
+        if transcript:
+            text_parts.append(transcript)
+
+        segment_words: list[WordTimestamp] = []
+        for word_info in getattr(alternative, "words", []):
+            word = WordTimestamp(
+                word=getattr(word_info, "word", ""),
+                start=_normalize_time(getattr(word_info, "start_time", None)),
+                end=_normalize_time(getattr(word_info, "end_time", None)),
+                speaker=_speaker_label(getattr(word_info, "speaker_tag", None)),
+            )
+            words.append(word)
+            segment_words.append(word)
+
+        processed_end = _normalize_audio_processed(getattr(result, "audio_processed", None))
+        word_start = segment_words[0].start if segment_words else None
+        word_end = segment_words[-1].end if segment_words else None
+
+        segment_start = previous_segment_end
+        if word_start is not None:
+            segment_start = max(previous_segment_end, min(word_start, processed_end if processed_end is not None else word_start))
+
+        segment_end = processed_end
+        if segment_end is None:
+            segment_end = word_end
+        elif word_end is not None:
+            segment_end = max(segment_start, max(word_end, processed_end))
+
+        if segment_end is None:
+            segment_end = segment_start
+
+        segments.append(
+            Segment(
+                id=index,
+                start=segment_start,
+                end=segment_end,
+                text=transcript,
+            )
+        )
+        previous_segment_end = segment_end
+
+    duration = None
+    if words and words[-1].end is not None:
+        duration = words[-1].end
+    elif segments and segments[-1].end is not None:
+        duration = segments[-1].end
+
+    return TranscriptionResult(
+        text=" ".join(part for part in text_parts if part).strip(),
+        language=language_code,
+        duration=duration,
+        words=words,
+        segments=segments,
+        raw_response=response,
+    )
+
+
+def merge_transcription_results(results: list[TranscriptionResult], offsets_seconds: list[float]) -> TranscriptionResult:
+    merged_words: list[WordTimestamp] = []
+    merged_segments: list[Segment] = []
+    next_id = 0
+
+    for result, offset in zip(results, offsets_seconds, strict=False):
+        for word in result.words:
+            merged_words.append(
+                WordTimestamp(
+                    word=word.word,
+                    start=None if word.start is None else word.start + offset,
+                    end=None if word.end is None else word.end + offset,
+                    speaker=word.speaker,
+                )
+            )
+        for segment in result.segments:
+            merged_segments.append(
+                Segment(
+                    id=next_id,
+                    start=None if segment.start is None else segment.start + offset,
+                    end=None if segment.end is None else segment.end + offset,
+                    text=segment.text,
+                )
+            )
+            next_id += 1
+
+    merged_words.sort(key=lambda w: ((w.start or 0.0), (w.end or w.start or 0.0)))
+    merged_segments.sort(key=lambda s: ((s.start or 0.0), (s.end or s.start or 0.0)))
+
+    duration = None
+    if merged_words and merged_words[-1].end is not None:
+        duration = merged_words[-1].end
+    elif merged_segments and merged_segments[-1].end is not None:
+        duration = merged_segments[-1].end
+
+    return TranscriptionResult(
+        text=" ".join(segment.text for segment in merged_segments if segment.text).strip(),
+        language=results[0].language if results else None,
+        duration=duration,
+        words=merged_words,
+        segments=merged_segments,
+        raw_response={"merged_results": len(results)},
+    )
+
+
+def split_pcm_by_size(audio_bytes: bytes, sample_rate_hz: int, max_chunk_bytes: int) -> tuple[list[bytes], list[float]]:
+    if max_chunk_bytes <= 0 or len(audio_bytes) <= max_chunk_bytes:
+        return [audio_bytes], [0.0]
+
+    bytes_per_second = sample_rate_hz * 2
+    aligned_max = max((max_chunk_bytes // 2) * 2, 2)
+
+    chunks: list[bytes] = []
+    offsets: list[float] = []
+    start = 0
+    while start < len(audio_bytes):
+        end = min(start + aligned_max, len(audio_bytes))
+        end = (end // 2) * 2
+        if end <= start:
+            end = min(start + 2, len(audio_bytes))
+        chunks.append(audio_bytes[start:end])
+        offsets.append(start / bytes_per_second)
+        start = end
+
+    return chunks, offsets
+
+
+def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
+    samples = array("h")
+    samples.frombytes(audio_bytes)
+    if not samples:
+        return [VADChunk(0, 0)]
+
+    frame_ms = 30
+    frame_size = max(1, int(sample_rate_hz * frame_ms / 1000))
+    energies: list[float] = []
+    frame_ranges: list[tuple[int, int]] = []
+
+    for frame_start in range(0, len(samples), frame_size):
+        frame_end = min(frame_start + frame_size, len(samples))
+        frame = samples[frame_start:frame_end]
+        energy = sum(abs(v) for v in frame) / max(1, len(frame))
+        energies.append(energy)
+        frame_ranges.append((frame_start, frame_end))
+
+    sorted_energy = sorted(energies)
+    noise_floor = sorted_energy[max(0, int(len(sorted_energy) * 0.2) - 1)] if sorted_energy else 0.0
+    threshold = max(250.0, noise_floor * 3.0)
+
+    chunks: list[VADChunk] = []
+    in_speech = False
+    speech_start = 0
+    silence_frames = 0
+    for idx, energy in enumerate(energies):
+        if energy >= threshold:
+            if not in_speech:
+                speech_start = frame_ranges[idx][0]
+                in_speech = True
+            silence_frames = 0
+            continue
+
+        if in_speech:
+            silence_frames += 1
+            if silence_frames >= 8:
+                speech_end = frame_ranges[idx][1]
+                chunks.append(VADChunk(speech_start, speech_end))
+                in_speech = False
+
+    if in_speech:
+        chunks.append(VADChunk(speech_start, len(samples)))
+
+    if not chunks:
+        chunks = [VADChunk(0, len(samples))]
+
+    padded: list[VADChunk] = []
+    pad = int(0.15 * sample_rate_hz)
+    for chunk in chunks:
+        start = max(0, chunk.start_sample - pad)
+        end = min(len(samples), chunk.end_sample + pad)
+        if padded and start <= padded[-1].end_sample + int(0.2 * sample_rate_hz):
+            padded[-1].end_sample = max(padded[-1].end_sample, end)
+        else:
+            padded.append(VADChunk(start, end))
+
+    max_samples = max(int(max_vad_segment_seconds * sample_rate_hz), 1)
+    split_chunks: list[VADChunk] = []
+    for chunk in padded:
+        start = chunk.start_sample
+        while start < chunk.end_sample:
+            end = min(start + max_samples, chunk.end_sample)
+            split_chunks.append(VADChunk(start, end))
+            start = end
+
+    return split_chunks
+
+
+def _build_packed_audio(audio_bytes: bytes, sample_rate_hz: int, chunks: list[VADChunk]) -> tuple[bytes, list[PackedPlacement]]:
+    total_samples = sample_rate_hz * 60
+    packed = bytearray(total_samples * 2)
+    placements: list[PackedPlacement] = []
+
+    for index, chunk in enumerate(chunks):
+        packed_start_sec = 30.0 * index
+        packed_start_sample = int(packed_start_sec * sample_rate_hz)
+
+        src_start = chunk.start_sample * 2
+        src_end = chunk.end_sample * 2
+        segment_bytes = audio_bytes[src_start:src_end]
+        dst_start = packed_start_sample * 2
+        dst_end = min(dst_start + len(segment_bytes), len(packed))
+        copy_size = max(0, dst_end - dst_start)
+        packed[dst_start:dst_end] = segment_bytes[:copy_size]
+
+        duration = copy_size / (sample_rate_hz * 2)
+        placements.append(
+            PackedPlacement(
+                original_start=chunk.start_sample / sample_rate_hz,
+                packed_start=packed_start_sec,
+                duration=duration,
+            )
+        )
+
+    return bytes(packed), placements
+
+
+def _map_word(word: WordTimestamp, placements: list[PackedPlacement]) -> WordTimestamp | None:
+    mapped_start = _map_time(word.start, placements)
+    mapped_end = _map_time(word.end, placements)
+    if mapped_start is None and mapped_end is None:
+        return None
+    return WordTimestamp(word=word.word, start=mapped_start, end=mapped_end, speaker=word.speaker)
+
+
+def _map_segment(segment: Segment, placements: list[PackedPlacement]) -> Segment | None:
+    mapped_start = _map_time(segment.start, placements)
+    mapped_end = _map_time(segment.end, placements)
+    if mapped_start is None and mapped_end is None:
+        return None
+    return Segment(id=segment.id, start=mapped_start, end=mapped_end, text=segment.text)
+
+
+def _map_time(value: float | None, placements: list[PackedPlacement]) -> float | None:
+    if value is None:
+        return None
+    for placement in placements:
+        lower = placement.packed_start
+        upper = placement.packed_start + placement.duration
+        if lower <= value <= upper + 1e-6:
+            return placement.original_start + (value - placement.packed_start)
+    return None
 
 
 def _speaker_label(speaker_tag: Any) -> str | None:

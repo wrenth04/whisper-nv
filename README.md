@@ -41,6 +41,8 @@ Optional environment variables:
 - `RIVA_SSL_CLIENT_KEY=/path/to/client.key`
 - `RIVA_METADATA=key1:value1,key2:value2`
 - `RIVA_MAX_MESSAGE_LENGTH=67108864`
+- `ASR_VAD_MAX_SEGMENT_SECONDS=10` (VAD 切段最長秒數)
+- `ASR_MAX_CHUNK_MB=50` (單次處理的 PCM 音訊上限，超過會分段呼叫 Riva 並合併時間軸)
 
 ## Docker
 
