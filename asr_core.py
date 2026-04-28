@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import dataclass
+import importlib
+import logging
 from typing import Any
 
 import grpc
 import riva.client
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,6 +76,14 @@ class PackedPlacement:
 
 class RivaTranscriptionError(RuntimeError):
     pass
+
+
+@dataclass
+class VADSelection:
+    engine: str
+    chunks: list[VADChunk]
+    reason: str
+    score: float
 
 
 class OfflineASRClient:
@@ -163,8 +175,15 @@ class OfflineASRClient:
         *,
         max_vad_segment_seconds: float = 10.0,
         max_request_bytes: int = 50 * 1024 * 1024,
+        vad_engine: str = "auto",
     ) -> TranscriptionResult:
-        segments = _vad_segments(audio_bytes, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+        vad_choice = _select_vad_segments(
+            audio_bytes,
+            sample_rate_hz,
+            max_vad_segment_seconds=max_vad_segment_seconds,
+            engine=vad_engine,
+        )
+        segments = vad_choice.chunks
         mapped_words: list[WordTimestamp] = []
         mapped_segments: list[Segment] = []
         segment_id = 0
@@ -205,7 +224,13 @@ class OfflineASRClient:
             duration=duration,
             words=mapped_words,
             segments=mapped_segments,
-            raw_response={"mode": "vad_packed", "segment_count": len(segments)},
+            raw_response={
+                "mode": "vad_packed",
+                "segment_count": len(segments),
+                "vad_engine": vad_choice.engine,
+                "vad_reason": vad_choice.reason,
+                "vad_score": vad_choice.score,
+            },
         )
 
 
@@ -345,6 +370,9 @@ def split_pcm_by_size(audio_bytes: bytes, sample_rate_hz: int, max_chunk_bytes: 
 
 
 def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
+    """
+    Energy-based fallback VAD.
+    """
     samples = array("h")
     samples.frombytes(audio_bytes)
     if not samples:
@@ -411,6 +439,264 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
             start = end
 
     return split_chunks
+
+
+def _select_vad_segments(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    *,
+    max_vad_segment_seconds: float,
+    engine: str,
+) -> VADSelection:
+    normalized_engine = (engine or "auto").strip().lower()
+    if normalized_engine in {"default", ""}:
+        normalized_engine = "auto"
+
+    candidates: list[VADSelection] = []
+    if normalized_engine in {"energy", "auto"}:
+        energy_chunks = _vad_segments(
+            audio_bytes,
+            sample_rate_hz,
+            max_vad_segment_seconds=max_vad_segment_seconds,
+        )
+        score, reason = _score_vad_chunks(
+            energy_chunks,
+            sample_rate_hz,
+            len(audio_bytes),
+            max_vad_segment_seconds=max_vad_segment_seconds,
+        )
+        candidates.append(VADSelection(engine="energy", chunks=energy_chunks, reason=reason, score=score))
+
+    if normalized_engine in {"webrtc", "auto"}:
+        webrtc_chunks = _vad_segments_webrtc(
+            audio_bytes,
+            sample_rate_hz,
+            max_vad_segment_seconds=max_vad_segment_seconds,
+        )
+        if webrtc_chunks:
+            score, reason = _score_vad_chunks(
+                webrtc_chunks,
+                sample_rate_hz,
+                len(audio_bytes),
+                max_vad_segment_seconds=max_vad_segment_seconds,
+            )
+            candidates.append(VADSelection(engine="webrtc", chunks=webrtc_chunks, reason=reason, score=score))
+
+    if normalized_engine in {"silero", "auto"}:
+        silero_chunks = _vad_segments_silero(
+            audio_bytes,
+            sample_rate_hz,
+            max_vad_segment_seconds=max_vad_segment_seconds,
+        )
+        if silero_chunks:
+            score, reason = _score_vad_chunks(
+                silero_chunks,
+                sample_rate_hz,
+                len(audio_bytes),
+                max_vad_segment_seconds=max_vad_segment_seconds,
+            )
+            candidates.append(VADSelection(engine="silero", chunks=silero_chunks, reason=reason, score=score))
+
+    if not candidates:
+        fallback = _vad_segments(audio_bytes, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+        score, reason = _score_vad_chunks(
+            fallback,
+            sample_rate_hz,
+            len(audio_bytes),
+            max_vad_segment_seconds=max_vad_segment_seconds,
+        )
+        return VADSelection(engine="energy", chunks=fallback, reason=f"fallback:{reason}", score=score)
+
+    if normalized_engine == "auto":
+        selected = max(candidates, key=lambda item: item.score)
+        return VADSelection(
+            engine=selected.engine,
+            chunks=selected.chunks,
+            reason=f"auto-selected from {[c.engine for c in candidates]}: {selected.reason}",
+            score=selected.score,
+        )
+
+    for candidate in candidates:
+        if candidate.engine == normalized_engine:
+            return candidate
+
+    fallback = max(candidates, key=lambda item: item.score)
+    return VADSelection(
+        engine=fallback.engine,
+        chunks=fallback.chunks,
+        reason=f"requested={normalized_engine} unavailable; fallback={fallback.engine}; {fallback.reason}",
+        score=fallback.score,
+    )
+
+
+def _score_vad_chunks(
+    chunks: list[VADChunk],
+    sample_rate_hz: int,
+    total_bytes: int,
+    *,
+    max_vad_segment_seconds: float,
+) -> tuple[float, str]:
+    total_duration = total_bytes / max(1, sample_rate_hz * 2)
+    if total_duration <= 0:
+        return 0.0, "empty-audio"
+
+    durations = [(c.end_sample - c.start_sample) / sample_rate_hz for c in chunks if c.end_sample > c.start_sample]
+    speech_duration = sum(durations)
+    speech_ratio = speech_duration / total_duration if total_duration > 0 else 0.0
+    avg_duration = (speech_duration / len(durations)) if durations else 0.0
+
+    too_long_penalty = sum(max(0.0, d - max_vad_segment_seconds) for d in durations)
+    fragmentation_penalty = max(0, len(durations) - int(total_duration / 3.0) - 1) * 0.02
+    target_speech_ratio = 0.45
+    ratio_penalty = abs(speech_ratio - target_speech_ratio)
+    score = (
+        1.0
+        - ratio_penalty
+        - (too_long_penalty / max(1.0, total_duration))
+        - fragmentation_penalty
+    )
+    return score, (
+        f"chunks={len(durations)},speech_ratio={speech_ratio:.2f},avg_sec={avg_duration:.2f},"
+        f"long_penalty={too_long_penalty:.2f},frag_penalty={fragmentation_penalty:.2f}"
+    )
+
+
+def _vad_segments_webrtc(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    *,
+    max_vad_segment_seconds: float,
+) -> list[VADChunk]:
+    try:
+        webrtcvad = importlib.import_module("webrtcvad")
+    except Exception:
+        return []
+
+    if sample_rate_hz not in {8000, 16000, 32000, 48000}:
+        return []
+
+    frame_ms = 30
+    frame_samples = int(sample_rate_hz * frame_ms / 1000)
+    frame_bytes = frame_samples * 2
+    if frame_bytes <= 0:
+        return []
+
+    vad = webrtcvad.Vad(2)
+    raw_chunks: list[VADChunk] = []
+    in_speech = False
+    start_sample = 0
+    silence_frames = 0
+    max_silence_frames = 8
+    total_samples = len(audio_bytes) // 2
+
+    for offset in range(0, len(audio_bytes) - frame_bytes + 1, frame_bytes):
+        frame = audio_bytes[offset : offset + frame_bytes]
+        is_speech = vad.is_speech(frame, sample_rate_hz)
+        current_sample = offset // 2
+        if is_speech:
+            if not in_speech:
+                in_speech = True
+                start_sample = current_sample
+            silence_frames = 0
+        elif in_speech:
+            silence_frames += 1
+            if silence_frames >= max_silence_frames:
+                end_sample = min(total_samples, current_sample + frame_samples)
+                raw_chunks.append(VADChunk(start_sample, end_sample))
+                in_speech = False
+
+    if in_speech:
+        raw_chunks.append(VADChunk(start_sample, total_samples))
+
+    return _postprocess_chunks(raw_chunks, sample_rate_hz, total_samples, max_vad_segment_seconds=max_vad_segment_seconds)
+
+
+def _vad_segments_silero(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    *,
+    max_vad_segment_seconds: float,
+) -> list[VADChunk]:
+    try:
+        torch = importlib.import_module("torch")
+        silero_vad = importlib.import_module("silero_vad")
+    except Exception:
+        return []
+
+    samples = array("h")
+    samples.frombytes(audio_bytes)
+    if not samples:
+        return []
+
+    model = _load_silero_model(silero_vad)
+    if model is None:
+        return []
+
+    audio_float = torch.tensor([s / 32768.0 for s in samples], dtype=torch.float32)
+    try:
+        timestamps = silero_vad.get_speech_timestamps(
+            audio_float,
+            model,
+            sampling_rate=sample_rate_hz,
+            min_speech_duration_ms=120,
+            min_silence_duration_ms=250,
+        )
+    except Exception as exc:
+        LOGGER.warning("silero-vad failed: %s", exc)
+        return []
+
+    raw_chunks = [VADChunk(int(item["start"]), int(item["end"])) for item in timestamps if "start" in item and "end" in item]
+    return _postprocess_chunks(raw_chunks, sample_rate_hz, len(samples), max_vad_segment_seconds=max_vad_segment_seconds)
+
+
+_SILERO_MODEL: Any = None
+
+
+def _load_silero_model(silero_vad_module: Any) -> Any:
+    global _SILERO_MODEL
+    if _SILERO_MODEL is not None:
+        return _SILERO_MODEL
+    try:
+        _SILERO_MODEL = silero_vad_module.load_silero_vad()
+    except Exception as exc:
+        LOGGER.warning("silero-vad model load failed: %s", exc)
+        return None
+    return _SILERO_MODEL
+
+
+def _postprocess_chunks(
+    chunks: list[VADChunk],
+    sample_rate_hz: int,
+    total_samples: int,
+    *,
+    max_vad_segment_seconds: float,
+) -> list[VADChunk]:
+    if not chunks:
+        return [VADChunk(0, total_samples)]
+
+    padded: list[VADChunk] = []
+    pad = int(0.15 * sample_rate_hz)
+    merge_gap = int(0.2 * sample_rate_hz)
+    for chunk in chunks:
+        start = max(0, chunk.start_sample - pad)
+        end = min(total_samples, chunk.end_sample + pad)
+        if end <= start:
+            continue
+        if padded and start <= padded[-1].end_sample + merge_gap:
+            padded[-1].end_sample = max(padded[-1].end_sample, end)
+        else:
+            padded.append(VADChunk(start, end))
+
+    max_samples = max(int(max_vad_segment_seconds * sample_rate_hz), 1)
+    split_chunks: list[VADChunk] = []
+    for chunk in padded:
+        start = chunk.start_sample
+        while start < chunk.end_sample:
+            end = min(start + max_samples, chunk.end_sample)
+            split_chunks.append(VADChunk(start, end))
+            start = end
+
+    return split_chunks or [VADChunk(0, total_samples)]
 
 
 def _build_packed_audio_batches(

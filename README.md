@@ -42,6 +42,7 @@ Optional environment variables:
 - `RIVA_METADATA=key1:value1,key2:value2`
 - `RIVA_MAX_MESSAGE_LENGTH=67108864`
 - `ASR_VAD_MAX_SEGMENT_SECONDS=10` (VAD 切段最長秒數)
+- `ASR_VAD_ENGINE=auto` (`auto|webrtc|silero|energy`，預設 `auto`；若值不合法會自動回退到 `auto`)
 - `ASR_MAX_CHUNK_MB=50` (單次處理的 PCM 音訊上限，超過會分段呼叫 Riva 並合併時間軸)
 
 ## Docker

@@ -17,6 +17,7 @@ from audio_decode import AudioDecodeError, decode_to_pcm_s16le
 
 
 app = FastAPI(title="whisper-nv", version="0.1.0")
+SUPPORTED_VAD_ENGINES = {"auto", "webrtc", "silero", "energy"}
 
 
 def get_client() -> OfflineASRClient:
@@ -108,6 +109,7 @@ async def create_transcription(
     max_chunk_mb = float(os.getenv("ASR_MAX_CHUNK_MB", "50"))
     max_chunk_bytes = int(max_chunk_mb * 1024 * 1024)
     max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
+    vad_engine = _get_vad_engine_from_env()
 
     chunks, offsets = split_pcm_by_size(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, max_chunk_bytes)
 
@@ -119,6 +121,7 @@ async def create_transcription(
                 config_options,
                 max_vad_segment_seconds=max_vad_segment_seconds,
                 max_request_bytes=max_chunk_bytes,
+                vad_engine=vad_engine,
             )
             for chunk in chunks
         ]
@@ -181,6 +184,13 @@ def _wants_word_timestamps(timestamp_granularities: list[str] | None) -> bool:
     if not timestamp_granularities:
         return False
     return "word" in timestamp_granularities
+
+
+def _get_vad_engine_from_env() -> str:
+    configured = os.getenv("ASR_VAD_ENGINE", "auto").strip().lower()
+    if configured in SUPPORTED_VAD_ENGINES:
+        return configured
+    return "auto"
 
 
 def _to_srt(segments) -> str:
