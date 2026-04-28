@@ -1,0 +1,19 @@
+services:
+  whisper-nv:
+    build:
+      context: .
+    ports:
+      - "8000:8000"
+    environment:
+      NVIDIA_API_KEY: ${NVIDIA_API_KEY}
+      RIVA_MAX_MESSAGE_LENGTH: "67108864"
+      # OPENAI_API_KEY: ${OPENAI_API_KEY}
+      # FUNCTION_ID: b702f636-f60c-4a3d-a6f4-f3568c13bd7d
+      # RIVA_SERVER: grpc.nvcf.nvidia.com:443
+      # RIVA_USE_SSL: "true"
+      # RIVA_METADATA: function-id:custom-function-id,authorization:Bearer your_api_key
+      # RIVA_SSL_ROOT_CERT: /certs/ca.pem
+      # RIVA_SSL_CLIENT_CERT: /certs/client.crt
+      # RIVA_SSL_CLIENT_KEY: /certs/client.key
+    # volumes:
+    #   - ./certs:/certs:ro
