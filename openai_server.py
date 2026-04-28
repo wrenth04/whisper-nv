@@ -118,6 +118,7 @@ async def create_transcription(
                 decoded_audio.sample_rate_hz,
                 config_options,
                 max_vad_segment_seconds=max_vad_segment_seconds,
+                max_request_bytes=max_chunk_bytes,
             )
             for chunk in chunks
         ]

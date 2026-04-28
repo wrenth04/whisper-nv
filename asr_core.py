@@ -67,6 +67,7 @@ class PackedPlacement:
     original_start: float
     packed_start: float
     duration: float
+    slot_duration: float
 
 
 class RivaTranscriptionError(RuntimeError):
@@ -161,15 +162,19 @@ class OfflineASRClient:
         config_options: ASRConfigOptions,
         *,
         max_vad_segment_seconds: float = 10.0,
+        max_request_bytes: int = 50 * 1024 * 1024,
     ) -> TranscriptionResult:
         segments = _vad_segments(audio_bytes, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
         mapped_words: list[WordTimestamp] = []
         mapped_segments: list[Segment] = []
         segment_id = 0
 
-        for idx in range(0, len(segments), 2):
-            pair = segments[idx : idx + 2]
-            packed_audio, placements = _build_packed_audio(audio_bytes, sample_rate_hz, pair)
+        for packed_audio, placements in _build_packed_audio_batches(
+            audio_bytes,
+            sample_rate_hz,
+            segments,
+            max_request_bytes=max_request_bytes,
+        ):
             packed_result = self.transcribe_bytes(packed_audio, sample_rate_hz, config_options)
 
             for word in packed_result.words:
@@ -408,33 +413,60 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
     return split_chunks
 
 
-def _build_packed_audio(audio_bytes: bytes, sample_rate_hz: int, chunks: list[VADChunk]) -> tuple[bytes, list[PackedPlacement]]:
-    total_samples = sample_rate_hz * 60
-    packed = bytearray(total_samples * 2)
-    placements: list[PackedPlacement] = []
-
-    for index, chunk in enumerate(chunks):
-        packed_start_sec = 30.0 * index
-        packed_start_sample = int(packed_start_sec * sample_rate_hz)
-
-        src_start = chunk.start_sample * 2
-        src_end = chunk.end_sample * 2
-        segment_bytes = audio_bytes[src_start:src_end]
-        dst_start = packed_start_sample * 2
-        dst_end = min(dst_start + len(segment_bytes), len(packed))
-        copy_size = max(0, dst_end - dst_start)
-        packed[dst_start:dst_end] = segment_bytes[:copy_size]
-
-        duration = copy_size / (sample_rate_hz * 2)
-        placements.append(
-            PackedPlacement(
-                original_start=chunk.start_sample / sample_rate_hz,
-                packed_start=packed_start_sec,
-                duration=duration,
-            )
+def _build_packed_audio_batches(
+    audio_bytes: bytes,
+    sample_rate_hz: int,
+    chunks: list[VADChunk],
+    *,
+    max_request_bytes: int,
+) -> list[tuple[bytes, list[PackedPlacement]]]:
+    bytes_per_sample = 2
+    slot_seconds = 30
+    slot_bytes = sample_rate_hz * bytes_per_sample * slot_seconds
+    if max_request_bytes < slot_bytes:
+        raise RivaTranscriptionError(
+            f"ASR_MAX_CHUNK_MB too small for one 30-second packed slot ({slot_bytes} bytes required)"
         )
+    slots_per_request = max(1, max_request_bytes // max(slot_bytes, 1))
 
-    return bytes(packed), placements
+    batches: list[tuple[bytes, list[PackedPlacement]]] = []
+    for offset in range(0, len(chunks), slots_per_request):
+        batch_chunks = chunks[offset : offset + slots_per_request]
+        total_slots = max(1, len(batch_chunks))
+        packed = bytearray(total_slots * slot_bytes)
+        placements: list[PackedPlacement] = []
+
+        for index, chunk in enumerate(batch_chunks):
+            packed_start_sec = float(slot_seconds * index)
+            packed_start_sample = int(packed_start_sec * sample_rate_hz)
+
+            src_start = chunk.start_sample * bytes_per_sample
+            src_end = chunk.end_sample * bytes_per_sample
+            segment_bytes = audio_bytes[src_start:src_end]
+            dst_start = packed_start_sample * bytes_per_sample
+            slot_end = min(dst_start + slot_bytes, len(packed))
+            dst_end = min(dst_start + len(segment_bytes), slot_end)
+            copy_size = max(0, dst_end - dst_start)
+            packed[dst_start:dst_end] = segment_bytes[:copy_size]
+
+            duration = copy_size / (sample_rate_hz * bytes_per_sample)
+            placements.append(
+                PackedPlacement(
+                    original_start=chunk.start_sample / sample_rate_hz,
+                    packed_start=packed_start_sec,
+                    duration=duration,
+                    slot_duration=float(slot_seconds),
+                )
+            )
+
+        packed_bytes = bytes(packed)
+        if len(packed_bytes) > max_request_bytes:
+            raise RivaTranscriptionError(
+                f"Packed VAD batch size {len(packed_bytes)} exceeds max request bytes {max_request_bytes}"
+            )
+        batches.append((packed_bytes, placements))
+
+    return batches
 
 
 def _map_word(word: WordTimestamp, placements: list[PackedPlacement]) -> WordTimestamp | None:
@@ -458,9 +490,10 @@ def _map_time(value: float | None, placements: list[PackedPlacement]) -> float |
         return None
     for placement in placements:
         lower = placement.packed_start
-        upper = placement.packed_start + placement.duration
+        upper = placement.packed_start + placement.slot_duration
         if lower <= value <= upper + 1e-6:
-            return placement.original_start + (value - placement.packed_start)
+            relative = min(max(0.0, value - placement.packed_start), placement.duration)
+            return placement.original_start + relative
     return None
 
 
