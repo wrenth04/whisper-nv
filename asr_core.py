@@ -15,7 +15,7 @@ class ASRConfigOptions:
     profanity_filter: bool = False
     automatic_punctuation: bool = True
     no_verbatim_transcripts: bool = False
-    word_time_offsets: bool = False
+    word_time_offsets: bool = True
     speaker_diarization: bool = False
     diarization_max_speakers: int = 8
     boosted_lm_words: list[str] | None = None
