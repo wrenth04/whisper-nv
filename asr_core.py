@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from array import array
 from dataclasses import dataclass
+import importlib
+import importlib.util
 from typing import Any
 
 import grpc
 import riva.client
-import webrtcvad
 
 
 @dataclass
@@ -352,9 +353,12 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
         return [VADChunk(0, 0)]
 
     supported_rates = {8000, 16000, 32000, 48000}
-    if sample_rate_hz not in supported_rates:
+    has_webrtcvad = importlib.util.find_spec("webrtcvad") is not None
+    has_pkg_resources = importlib.util.find_spec("pkg_resources") is not None
+    if sample_rate_hz not in supported_rates or not has_webrtcvad or not has_pkg_resources:
         return _vad_segments_energy(samples, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
 
+    webrtcvad = importlib.import_module("webrtcvad")
     vad = webrtcvad.Vad(2)
     frame_ms = 30
     frame_size = int(sample_rate_hz * frame_ms / 1000)
