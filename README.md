@@ -44,6 +44,7 @@ Optional environment variables:
 - `ASR_VAD_MAX_SEGMENT_SECONDS=10` (VAD 切段最長秒數)
 - `ASR_MAX_CHUNK_MB=50` (單次處理的 PCM 音訊上限，超過會分段呼叫 Riva 並合併時間軸)
 - `ASR_NO_VERBATIM_TRANSCRIPTS=true` (優先在 decoder 端抑制口語重覆/贅字，降低重覆 token 輸出)
+- `ASR_MAX_CONSECUTIVE_PHRASE_REPEATS=2` (後處理重覆片語最多保留次數，日文連續喊話建議 1~2)
 
 ## Docker
 

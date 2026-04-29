@@ -132,7 +132,7 @@ async def create_transcription(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     postprocess_options = PostProcessOptions(
-        max_consecutive_phrase_repeats=max(1, int(os.getenv("ASR_MAX_CONSECUTIVE_PHRASE_REPEATS", "3"))),
+        max_consecutive_phrase_repeats=max(1, int(os.getenv("ASR_MAX_CONSECUTIVE_PHRASE_REPEATS", "2"))),
         adjacent_segment_similarity_threshold=float(os.getenv("ASR_ADJ_DUPLICATE_SIMILARITY", "0.96")),
     )
     result = postprocess_transcription(result, postprocess_options)

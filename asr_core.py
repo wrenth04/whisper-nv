@@ -62,7 +62,7 @@ class TranscriptionResult:
 @dataclass
 class PostProcessOptions:
     dedupe_repeated_phrases: bool = True
-    max_consecutive_phrase_repeats: int = 3
+    max_consecutive_phrase_repeats: int = 2
     dedupe_adjacent_segments: bool = True
     adjacent_segment_similarity_threshold: float = 0.96
     collapse_music_tokens: bool = True
@@ -371,6 +371,7 @@ def _normalize_segment_text(text: str, options: PostProcessOptions) -> str:
     if options.collapse_music_tokens:
         normalized = _collapse_music_tokens(normalized)
     if options.dedupe_repeated_phrases:
+        normalized = _collapse_periodic_text(normalized, options.max_consecutive_phrase_repeats)
         normalized = _limit_consecutive_phrase_repeats(normalized, options.max_consecutive_phrase_repeats)
         normalized = _limit_repeated_japanese_phrases(normalized, options.max_consecutive_phrase_repeats)
     normalized = _limit_char_runs(normalized, options.max_consecutive_char_run)
@@ -454,6 +455,23 @@ def _limit_char_runs(text: str, max_run: int) -> str:
     if max_run < 1:
         return text
     return re.sub(rf"(.)\1{{{max_run},}}", lambda m: m.group(1) * max_run, text)
+
+
+def _collapse_periodic_text(text: str, max_repeat: int) -> str:
+    if max_repeat < 1:
+        return text
+    unit_pattern = re.compile(r"(.+?[!！?？。♪])(?:\1){2,}")
+    result = text
+    while True:
+        match = unit_pattern.search(result)
+        if not match:
+            break
+        unit = match.group(1)
+        run = match.group(0)
+        repeats = len(run) // len(unit)
+        replacement = unit * min(repeats, max_repeat)
+        result = f"{result[:match.start()]}{replacement}{result[match.end():]}"
+    return result
 
 
 def _is_near_duplicate(left: str, right: str, threshold: float) -> bool:
