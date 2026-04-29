@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import os
+from hashlib import sha256
 from typing import Annotated
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from asr_core import ASRConfigOptions, OfflineASRClient, RivaTranscriptionError
+from asr_core import (
+    ASRConfigOptions,
+    OfflineASRClient,
+    PostProcessOptions,
+    RivaTranscriptionError,
+    merge_transcription_results,
+    postprocess_transcription,
+    split_pcm_by_size,
+)
 from audio_decode import AudioDecodeError, decode_to_pcm_s16le
 
 
@@ -39,6 +48,7 @@ def get_client() -> OfflineASRClient:
 
 client = get_client()
 api_key = os.getenv("OPENAI_API_KEY")
+_LAST_RESPONSE_FINGERPRINT: str | None = None
 
 
 @app.get("/health")
@@ -97,49 +107,72 @@ async def create_transcription(
         language_code=language,
         model_name=None if model == "whisper-1" else model,
         word_time_offsets=wants_verbose or _wants_word_timestamps(timestamp_granularities),
+        no_verbatim_transcripts=os.getenv("ASR_NO_VERBATIM_TRANSCRIPTS", "true").lower() == "true",
     )
 
+    max_chunk_mb = float(os.getenv("ASR_MAX_CHUNK_MB", "50"))
+    max_chunk_bytes = int(max_chunk_mb * 1024 * 1024)
+    max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
+
+    chunks, offsets = split_pcm_by_size(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, max_chunk_bytes)
+
     try:
-        result = client.transcribe_bytes(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, config_options)
+        partial_results = [
+            client.transcribe_vad_packed(
+                chunk,
+                decoded_audio.sample_rate_hz,
+                config_options,
+                max_vad_segment_seconds=max_vad_segment_seconds,
+                max_request_bytes=max_chunk_bytes,
+            )
+            for chunk in chunks
+        ]
+        result = merge_transcription_results(partial_results, offsets)
     except RivaTranscriptionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    postprocess_options = PostProcessOptions(
+        max_consecutive_phrase_repeats=max(1, int(os.getenv("ASR_MAX_CONSECUTIVE_PHRASE_REPEATS", "2"))),
+        adjacent_segment_similarity_threshold=float(os.getenv("ASR_ADJ_DUPLICATE_SIMILARITY", "0.96")),
+    )
+    result = postprocess_transcription(result, postprocess_options)
 
     if response_format == "text":
         return PlainTextResponse(result.text)
     if response_format == "json":
         return JSONResponse({"text": result.text})
     if response_format == "verbose_json":
-        return JSONResponse(
-            {
-                "task": "transcribe",
-                "language": result.language or language,
-                "duration": result.duration,
-                "text": result.text,
-                "words": [
-                    {
-                        "word": word.word,
-                        "start": word.start,
-                        "end": word.end,
-                    }
-                    for word in result.words
-                ],
-                "segments": [
-                    {
-                        "id": segment.id,
-                        "seek": int((segment.start or 0.0) * 100),
-                        "start": segment.start,
-                        "end": segment.end,
-                        "text": segment.text,
-                        "tokens": [],
-                        "temperature": 0.0,
-                        "avg_logprob": 0.0,
-                        "compression_ratio": 0.0,
-                        "no_speech_prob": 0.0,
-                    }
-                    for segment in result.segments
-                ],
-            }
-        )
+        payload = {
+            "task": "transcribe",
+            "language": result.language or language,
+            "duration": result.duration,
+            "text": result.text,
+            "words": [
+                {
+                    "word": word.word,
+                    "start": word.start,
+                    "end": word.end,
+                }
+                for word in result.words
+            ],
+            "segments": [
+                {
+                    "id": segment.id,
+                    "seek": int((segment.start or 0.0) * 100),
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text,
+                    "tokens": [],
+                    "temperature": 0.0,
+                    "avg_logprob": 0.0,
+                    "compression_ratio": 0.0,
+                    "no_speech_prob": 0.0,
+                }
+                for segment in result.segments
+            ],
+        }
+        _dedupe_repeated_response(payload)
+        return JSONResponse(payload)
     if response_format == "srt":
         return PlainTextResponse(_to_srt(result.segments), media_type="text/plain; charset=utf-8")
     if response_format == "vtt":
@@ -198,3 +231,11 @@ def _format_vtt_time(seconds: float) -> str:
     whole_seconds = int(remainder)
     milliseconds = int(round((remainder - whole_seconds) * 1000))
     return f"{int(hours):02}:{int(minutes):02}:{whole_seconds:02}.{milliseconds:03}"
+
+
+def _dedupe_repeated_response(payload: dict[str, object]) -> None:
+    global _LAST_RESPONSE_FINGERPRINT
+    fingerprint = sha256(str(payload).encode("utf-8")).hexdigest()
+    if fingerprint == _LAST_RESPONSE_FINGERPRINT:
+        payload["dedupe_note"] = "Duplicate payload suppressed at sink"
+    _LAST_RESPONSE_FINGERPRINT = fingerprint
