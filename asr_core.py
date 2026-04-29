@@ -6,6 +6,7 @@ from typing import Any
 
 import grpc
 import riva.client
+import webrtcvad
 
 
 @dataclass
@@ -350,6 +351,50 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
     if not samples:
         return [VADChunk(0, 0)]
 
+    supported_rates = {8000, 16000, 32000, 48000}
+    if sample_rate_hz not in supported_rates:
+        return _vad_segments_energy(samples, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+
+    vad = webrtcvad.Vad(2)
+    frame_ms = 30
+    frame_size = int(sample_rate_hz * frame_ms / 1000)
+    silence_limit_frames = max(1, int(300 / frame_ms))
+
+    chunks: list[VADChunk] = []
+    in_speech = False
+    speech_start = 0
+    silence_frames = 0
+
+    for frame_start in range(0, len(samples), frame_size):
+        frame_end = min(frame_start + frame_size, len(samples))
+        frame = samples[frame_start:frame_end]
+        if len(frame) < frame_size:
+            frame.extend([0] * (frame_size - len(frame)))
+        is_speech = vad.is_speech(frame.tobytes(), sample_rate_hz)
+
+        if is_speech:
+            if not in_speech:
+                speech_start = frame_start
+                in_speech = True
+            silence_frames = 0
+            continue
+
+        if in_speech:
+            silence_frames += 1
+            if silence_frames >= silence_limit_frames:
+                chunks.append(VADChunk(speech_start, frame_end))
+                in_speech = False
+
+    if in_speech:
+        chunks.append(VADChunk(speech_start, len(samples)))
+
+    if not chunks:
+        chunks = [VADChunk(0, len(samples))]
+
+    return _postprocess_vad_chunks(chunks, len(samples), sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+
+
+def _vad_segments_energy(samples: array, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
     frame_ms = 30
     frame_size = max(1, int(sample_rate_hz * frame_ms / 1000))
     energies: list[float] = []
@@ -391,11 +436,15 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
     if not chunks:
         chunks = [VADChunk(0, len(samples))]
 
+    return _postprocess_vad_chunks(chunks, len(samples), sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+
+
+def _postprocess_vad_chunks(chunks: list[VADChunk], sample_count: int, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
     padded: list[VADChunk] = []
     pad = int(0.15 * sample_rate_hz)
     for chunk in chunks:
         start = max(0, chunk.start_sample - pad)
-        end = min(len(samples), chunk.end_sample + pad)
+        end = min(sample_count, chunk.end_sample + pad)
         if padded and start <= padded[-1].end_sample + int(0.2 * sample_rate_hz):
             padded[-1].end_sample = max(padded[-1].end_sample, end)
         else:
