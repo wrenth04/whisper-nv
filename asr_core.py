@@ -413,18 +413,41 @@ def _limit_consecutive_phrase_repeats(text: str, max_repeat: int) -> str:
 def _limit_repeated_japanese_phrases(text: str, max_repeat: int) -> str:
     if max_repeat < 1:
         return text
-    output = text
-    for phrase_len in range(12, 1, -1):
-        pattern = re.compile(rf"(.{{{phrase_len}}})(?:\1)+")
-        while True:
-            match = pattern.search(output)
-            if not match:
+    if len(text) < 4:
+        return text
+
+    chars = text
+    out: list[str] = []
+    i = 0
+    max_phrase_len = min(12, len(chars) // 2)
+    while i < len(chars):
+        best_len = 0
+        best_repeats = 1
+
+        for phrase_len in range(max_phrase_len, 1, -1):
+            if i + phrase_len * 2 > len(chars):
+                continue
+            phrase = chars[i : i + phrase_len]
+            repeats = 1
+            cursor = i + phrase_len
+            while cursor + phrase_len <= len(chars) and chars[cursor : cursor + phrase_len] == phrase:
+                repeats += 1
+                cursor += phrase_len
+            if repeats > 1:
+                best_len = phrase_len
+                best_repeats = repeats
                 break
-            phrase = match.group(1)
-            repeats = len(match.group(0)) // phrase_len
-            replacement = phrase * min(repeats, max_repeat)
-            output = f"{output[:match.start()]}{replacement}{output[match.end():]}"
-    return output
+
+        if best_len > 0:
+            phrase = chars[i : i + best_len]
+            out.append(phrase * min(best_repeats, max_repeat))
+            i += best_len * best_repeats
+            continue
+
+        out.append(chars[i])
+        i += 1
+
+    return "".join(out)
 
 
 def _limit_char_runs(text: str, max_run: int) -> str:

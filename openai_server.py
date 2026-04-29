@@ -107,6 +107,7 @@ async def create_transcription(
         language_code=language,
         model_name=None if model == "whisper-1" else model,
         word_time_offsets=wants_verbose or _wants_word_timestamps(timestamp_granularities),
+        no_verbatim_transcripts=os.getenv("ASR_NO_VERBATIM_TRANSCRIPTS", "true").lower() == "true",
     )
 
     max_chunk_mb = float(os.getenv("ASR_MAX_CHUNK_MB", "50"))
