@@ -66,6 +66,7 @@ class PostProcessOptions:
     dedupe_adjacent_segments: bool = True
     adjacent_segment_similarity_threshold: float = 0.96
     collapse_music_tokens: bool = True
+    max_consecutive_char_run: int = 12
 
 
 @dataclass
@@ -371,6 +372,8 @@ def _normalize_segment_text(text: str, options: PostProcessOptions) -> str:
         normalized = _collapse_music_tokens(normalized)
     if options.dedupe_repeated_phrases:
         normalized = _limit_consecutive_phrase_repeats(normalized, options.max_consecutive_phrase_repeats)
+        normalized = _limit_repeated_japanese_phrases(normalized, options.max_consecutive_phrase_repeats)
+    normalized = _limit_char_runs(normalized, options.max_consecutive_char_run)
     return normalized.strip()
 
 
@@ -405,6 +408,29 @@ def _limit_consecutive_phrase_repeats(text: str, max_repeat: int) -> str:
             out.append(tokens[idx])
             idx += 1
     return " ".join(out)
+
+
+def _limit_repeated_japanese_phrases(text: str, max_repeat: int) -> str:
+    if max_repeat < 1:
+        return text
+    output = text
+    for phrase_len in range(12, 1, -1):
+        pattern = re.compile(rf"(.{{{phrase_len}}})(?:\1)+")
+        while True:
+            match = pattern.search(output)
+            if not match:
+                break
+            phrase = match.group(1)
+            repeats = len(match.group(0)) // phrase_len
+            replacement = phrase * min(repeats, max_repeat)
+            output = f"{output[:match.start()]}{replacement}{output[match.end():]}"
+    return output
+
+
+def _limit_char_runs(text: str, max_run: int) -> str:
+    if max_run < 1:
+        return text
+    return re.sub(rf"(.)\1{{{max_run},}}", lambda m: m.group(1) * max_run, text)
 
 
 def _is_near_duplicate(left: str, right: str, threshold: float) -> bool:
