@@ -4,6 +4,7 @@ from array import array
 from dataclasses import dataclass
 import importlib
 import importlib.util
+import re
 from typing import Any
 
 import grpc
@@ -56,6 +57,15 @@ class TranscriptionResult:
     words: list[WordTimestamp]
     segments: list[Segment]
     raw_response: Any
+
+
+@dataclass
+class PostProcessOptions:
+    dedupe_repeated_phrases: bool = True
+    max_consecutive_phrase_repeats: int = 3
+    dedupe_adjacent_segments: bool = True
+    adjacent_segment_similarity_threshold: float = 0.96
+    collapse_music_tokens: bool = True
 
 
 @dataclass
@@ -322,6 +332,93 @@ def merge_transcription_results(results: list[TranscriptionResult], offsets_seco
         segments=merged_segments,
         raw_response={"merged_results": len(results)},
     )
+
+
+def postprocess_transcription(result: TranscriptionResult, options: PostProcessOptions | None = None) -> TranscriptionResult:
+    opts = options or PostProcessOptions()
+    processed_segments: list[Segment] = []
+
+    for segment in result.segments:
+        text = _normalize_segment_text(segment.text, opts)
+        if not text:
+            continue
+
+        if opts.dedupe_adjacent_segments and processed_segments:
+            prev = processed_segments[-1]
+            if _is_near_duplicate(prev.text, text, opts.adjacent_segment_similarity_threshold):
+                prev.end = max(prev.end or 0.0, segment.end or prev.end or 0.0)
+                continue
+
+        processed_segments.append(
+            Segment(id=len(processed_segments), start=segment.start, end=segment.end, text=text)
+        )
+
+    return TranscriptionResult(
+        text=" ".join(seg.text for seg in processed_segments if seg.text).strip(),
+        language=result.language,
+        duration=result.duration,
+        words=result.words,
+        segments=processed_segments,
+        raw_response=result.raw_response,
+    )
+
+
+def _normalize_segment_text(text: str, options: PostProcessOptions) -> str:
+    normalized = text.strip()
+    if not normalized:
+        return ""
+    if options.collapse_music_tokens:
+        normalized = _collapse_music_tokens(normalized)
+    if options.dedupe_repeated_phrases:
+        normalized = _limit_consecutive_phrase_repeats(normalized, options.max_consecutive_phrase_repeats)
+    return normalized.strip()
+
+
+def _collapse_music_tokens(text: str) -> str:
+    collapsed = re.sub(r"(?:♪~?|♫|♬)(?:\s*(?:♪~?|♫|♬))+", "♪", text)
+    collapsed = re.sub(r"\s+", " ", collapsed)
+    return collapsed
+
+
+def _limit_consecutive_phrase_repeats(text: str, max_repeat: int) -> str:
+    if max_repeat < 1:
+        return text
+    tokens = text.split()
+    if len(tokens) < 2:
+        return text
+
+    out: list[str] = []
+    idx = 0
+    while idx < len(tokens):
+        matched = False
+        for n in range(min(6, len(tokens) - idx), 1, -1):
+            phrase = tokens[idx : idx + n]
+            repeats = 1
+            while idx + (repeats + 1) * n <= len(tokens) and tokens[idx + repeats * n : idx + (repeats + 1) * n] == phrase:
+                repeats += 1
+            if repeats > 1:
+                out.extend(phrase * min(repeats, max_repeat))
+                idx += repeats * n
+                matched = True
+                break
+        if not matched:
+            out.append(tokens[idx])
+            idx += 1
+    return " ".join(out)
+
+
+def _is_near_duplicate(left: str, right: str, threshold: float) -> bool:
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    l_tokens = left.split()
+    r_tokens = right.split()
+    if not l_tokens or not r_tokens:
+        return False
+    common = sum(1 for i, tok in enumerate(l_tokens[: min(len(l_tokens), len(r_tokens))]) if tok == r_tokens[i])
+    ratio = common / max(len(l_tokens), len(r_tokens))
+    return ratio >= threshold
 
 
 def split_pcm_by_size(audio_bytes: bytes, sample_rate_hz: int, max_chunk_bytes: int) -> tuple[list[bytes], list[float]]:
