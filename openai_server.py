@@ -218,19 +218,19 @@ def _to_vtt(segments) -> str:
 
 
 def _format_srt_time(seconds: float) -> str:
-    hours, remainder = divmod(seconds, 3600)
-    minutes, remainder = divmod(remainder, 60)
-    whole_seconds = int(remainder)
-    milliseconds = int(round((remainder - whole_seconds) * 1000))
-    return f"{int(hours):02}:{int(minutes):02}:{whole_seconds:02},{milliseconds:03}"
+    total_ms = max(0, int(round(seconds * 1000)))
+    total_seconds, milliseconds = divmod(total_ms, 1000)
+    minutes, whole_seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{whole_seconds:02},{milliseconds:03}"
 
 
 def _format_vtt_time(seconds: float) -> str:
-    hours, remainder = divmod(seconds, 3600)
-    minutes, remainder = divmod(remainder, 60)
-    whole_seconds = int(remainder)
-    milliseconds = int(round((remainder - whole_seconds) * 1000))
-    return f"{int(hours):02}:{int(minutes):02}:{whole_seconds:02}.{milliseconds:03}"
+    total_ms = max(0, int(round(seconds * 1000)))
+    total_seconds, milliseconds = divmod(total_ms, 1000)
+    minutes, whole_seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours:02}:{minutes:02}:{whole_seconds:02}.{milliseconds:03}"
 
 
 def _dedupe_repeated_response(payload: dict[str, object]) -> None:

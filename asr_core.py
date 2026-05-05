@@ -195,22 +195,39 @@ class OfflineASRClient:
                 if mapped:
                     mapped_words.append(mapped)
 
+            placement_texts: dict[int, list[str]] = {}
             for seg in packed_result.segments:
-                mapped = _map_segment(seg, placements)
-                if not mapped or not mapped.text:
+                placement_index = _placement_index_for_segment(seg, placements)
+                if placement_index is None:
                     continue
-                mapped.id = segment_id
-                mapped_segments.append(mapped)
+                text = seg.text.strip()
+                if not text:
+                    continue
+                placement_texts.setdefault(placement_index, []).append(text)
+
+            for placement_index in sorted(placement_texts):
+                placement = placements[placement_index]
+                text = " ".join(part for part in placement_texts[placement_index] if part).strip()
+                if not text:
+                    continue
+                mapped_segments.append(
+                    Segment(
+                        id=segment_id,
+                        start=placement.original_start,
+                        end=placement.original_start + placement.duration,
+                        text=text,
+                    )
+                )
                 segment_id += 1
 
         mapped_words.sort(key=lambda w: ((w.start or 0.0), (w.end or w.start or 0.0)))
         mapped_segments.sort(key=lambda s: ((s.start or 0.0), (s.end or s.start or 0.0)))
 
         duration = None
-        if mapped_words and mapped_words[-1].end is not None:
-            duration = mapped_words[-1].end
-        elif mapped_segments and mapped_segments[-1].end is not None:
+        if mapped_segments and mapped_segments[-1].end is not None:
             duration = mapped_segments[-1].end
+        elif mapped_words and mapped_words[-1].end is not None:
+            duration = mapped_words[-1].end
 
         return TranscriptionResult(
             text=" ".join(seg.text for seg in mapped_segments if seg.text).strip(),
@@ -354,10 +371,15 @@ def postprocess_transcription(result: TranscriptionResult, options: PostProcessO
             Segment(id=len(processed_segments), start=segment.start, end=segment.end, text=text)
         )
 
+    duration = None
+    for segment in processed_segments:
+        if segment.end is not None:
+            duration = max(duration or 0.0, segment.end)
+
     return TranscriptionResult(
         text=" ".join(seg.text for seg in processed_segments if seg.text).strip(),
         language=result.language,
-        duration=result.duration,
+        duration=duration,
         words=result.words,
         segments=processed_segments,
         raw_response=result.raw_response,
@@ -686,6 +708,28 @@ def _build_packed_audio_batches(
     return batches
 
 
+_PACKED_TIME_TOLERANCE_SECONDS = 0.1
+
+
+def _placement_at_time(value: float | None, placements: list[PackedPlacement]) -> tuple[int, PackedPlacement] | None:
+    if value is None:
+        return None
+    for index, placement in enumerate(placements):
+        lower = placement.packed_start - _PACKED_TIME_TOLERANCE_SECONDS
+        upper = placement.packed_start + placement.duration + _PACKED_TIME_TOLERANCE_SECONDS
+        if lower <= value <= upper:
+            return index, placement
+    return None
+
+
+def _placement_index_for_segment(segment: Segment, placements: list[PackedPlacement]) -> int | None:
+    for value in (segment.start, segment.end):
+        matched = _placement_at_time(value, placements)
+        if matched is not None:
+            return matched[0]
+    return None
+
+
 def _map_word(word: WordTimestamp, placements: list[PackedPlacement]) -> WordTimestamp | None:
     mapped_start = _map_time(word.start, placements)
     mapped_end = _map_time(word.end, placements)
@@ -703,15 +747,13 @@ def _map_segment(segment: Segment, placements: list[PackedPlacement]) -> Segment
 
 
 def _map_time(value: float | None, placements: list[PackedPlacement]) -> float | None:
-    if value is None:
+    matched = _placement_at_time(value, placements)
+    if matched is None:
         return None
-    for placement in placements:
-        lower = placement.packed_start
-        upper = placement.packed_start + placement.slot_duration
-        if lower <= value <= upper + 1e-6:
-            relative = min(max(0.0, value - placement.packed_start), placement.duration)
-            return placement.original_start + relative
-    return None
+    _, placement = matched
+    assert value is not None
+    relative = min(max(0.0, value - placement.packed_start), placement.duration)
+    return placement.original_start + relative
 
 
 def _speaker_label(speaker_tag: Any) -> str | None:
