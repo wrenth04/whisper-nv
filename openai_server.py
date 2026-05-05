@@ -29,14 +29,15 @@ logger = logging.getLogger("whisper-nv")
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     started = time.perf_counter()
+    client_ip, client_port = _request_client(request)
     try:
         response = await call_next(request)
     except Exception:
-        elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.exception("%s %s -> error %.1fms", request.method, request.url.path, elapsed_ms)
+        elapsed = _format_elapsed(time.perf_counter() - started)
+        logger.exception("%s:%s %s %s -> error %s", client_ip, client_port, request.method, request.url.path, elapsed)
         raise
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info("%s %s -> %s %.1fms", request.method, request.url.path, response.status_code, elapsed_ms)
+    elapsed = _format_elapsed(time.perf_counter() - started)
+    logger.info("%s:%s %s %s -> %s %s", client_ip, client_port, request.method, request.url.path, response.status_code, elapsed)
     return response
 
 
@@ -249,6 +250,34 @@ def _format_vtt_time(seconds: float) -> str:
     minutes, whole_seconds = divmod(total_seconds, 60)
     hours, minutes = divmod(minutes, 60)
     return f"{hours:02}:{minutes:02}:{whole_seconds:02}.{milliseconds:03}"
+
+
+def _format_elapsed(seconds: float) -> str:
+    total_ms = max(0, int(round(seconds * 1000)))
+    total_seconds, milliseconds = divmod(total_ms, 1000)
+    minutes, whole_seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h{minutes}m{whole_seconds}.{milliseconds:03}s"
+    return f"{minutes}m{whole_seconds}.{milliseconds:03}s"
+
+
+def _request_client(request: Request) -> tuple[str, str]:
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        ip = forwarded_for.split(",", 1)[0].strip()
+        port = request.client.port if request.client and request.client.port is not None else "-"
+        return ip or "unknown", str(port)
+
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        port = request.client.port if request.client and request.client.port is not None else "-"
+        return real_ip.strip() or "unknown", str(port)
+
+    client = request.client
+    if client:
+        return client.host, str(client.port if client.port is not None else "-")
+    return "unknown", "-"
 
 
 def _dedupe_repeated_response(payload: dict[str, object]) -> None:
