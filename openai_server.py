@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from hashlib import sha256
 from typing import Annotated
 
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from asr_core import (
@@ -20,6 +22,22 @@ from audio_decode import AudioDecodeError, decode_to_pcm_s16le
 
 
 app = FastAPI(title="whisper-nv", version="0.1.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger("whisper-nv")
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.exception("%s %s -> error %.1fms", request.method, request.url.path, elapsed_ms)
+        raise
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.info("%s %s -> %s %.1fms", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 def get_client() -> OfflineASRClient:
