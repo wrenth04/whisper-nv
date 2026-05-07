@@ -76,6 +76,25 @@ class VADChunk:
 
 
 @dataclass
+class VADProfile:
+    frame_ms: int = 30
+    webrtc_mode: int = 2
+    silence_limit_frames: int = 10
+    energy_threshold: float = 250.0
+    pad_seconds: float = 0.15
+    merge_gap_seconds: float = 0.2
+
+
+@dataclass
+class VADChunkStats:
+    chunk_count: int
+    median_duration_seconds: float
+    median_gap_seconds: float
+    short_chunk_ratio: float
+    span_seconds: float
+
+
+@dataclass
 class PackedPlacement:
     original_start: float
     packed_start: float
@@ -195,22 +214,39 @@ class OfflineASRClient:
                 if mapped:
                     mapped_words.append(mapped)
 
+            placement_texts: dict[int, list[str]] = {}
             for seg in packed_result.segments:
-                mapped = _map_segment(seg, placements)
-                if not mapped or not mapped.text:
+                placement_index = _placement_index_for_segment(seg, placements)
+                if placement_index is None:
                     continue
-                mapped.id = segment_id
-                mapped_segments.append(mapped)
+                text = seg.text.strip()
+                if not text:
+                    continue
+                placement_texts.setdefault(placement_index, []).append(text)
+
+            for placement_index in sorted(placement_texts):
+                placement = placements[placement_index]
+                text = " ".join(part for part in placement_texts[placement_index] if part).strip()
+                if not text:
+                    continue
+                mapped_segments.append(
+                    Segment(
+                        id=segment_id,
+                        start=placement.original_start,
+                        end=placement.original_start + placement.duration,
+                        text=text,
+                    )
+                )
                 segment_id += 1
 
         mapped_words.sort(key=lambda w: ((w.start or 0.0), (w.end or w.start or 0.0)))
         mapped_segments.sort(key=lambda s: ((s.start or 0.0), (s.end or s.start or 0.0)))
 
         duration = None
-        if mapped_words and mapped_words[-1].end is not None:
-            duration = mapped_words[-1].end
-        elif mapped_segments and mapped_segments[-1].end is not None:
+        if mapped_segments and mapped_segments[-1].end is not None:
             duration = mapped_segments[-1].end
+        elif mapped_words and mapped_words[-1].end is not None:
+            duration = mapped_words[-1].end
 
         return TranscriptionResult(
             text=" ".join(seg.text for seg in mapped_segments if seg.text).strip(),
@@ -354,10 +390,15 @@ def postprocess_transcription(result: TranscriptionResult, options: PostProcessO
             Segment(id=len(processed_segments), start=segment.start, end=segment.end, text=text)
         )
 
+    duration = None
+    for segment in processed_segments:
+        if segment.end is not None:
+            duration = max(duration or 0.0, segment.end)
+
     return TranscriptionResult(
         text=" ".join(seg.text for seg in processed_segments if seg.text).strip(),
         language=result.language,
-        duration=result.duration,
+        duration=duration,
         words=result.words,
         segments=processed_segments,
         raw_response=result.raw_response,
@@ -516,17 +557,16 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
     if not samples:
         return [VADChunk(0, 0)]
 
+    profile = _estimate_vad_profile(samples, sample_rate_hz)
     supported_rates = {8000, 16000, 32000, 48000}
     has_webrtcvad = importlib.util.find_spec("webrtcvad") is not None
     has_pkg_resources = importlib.util.find_spec("pkg_resources") is not None
     if sample_rate_hz not in supported_rates or not has_webrtcvad or not has_pkg_resources:
-        return _vad_segments_energy(samples, sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+        return _vad_segments_energy(samples, sample_rate_hz, profile=profile, max_vad_segment_seconds=max_vad_segment_seconds)
 
     webrtcvad = importlib.import_module("webrtcvad")
-    vad = webrtcvad.Vad(2)
-    frame_ms = 30
-    frame_size = int(sample_rate_hz * frame_ms / 1000)
-    silence_limit_frames = max(1, int(300 / frame_ms))
+    vad = webrtcvad.Vad(profile.webrtc_mode)
+    frame_size = max(1, int(sample_rate_hz * profile.frame_ms / 1000))
 
     chunks: list[VADChunk] = []
     in_speech = False
@@ -549,7 +589,7 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
 
         if in_speech:
             silence_frames += 1
-            if silence_frames >= silence_limit_frames:
+            if silence_frames >= profile.silence_limit_frames:
                 chunks.append(VADChunk(speech_start, frame_end))
                 in_speech = False
 
@@ -559,12 +599,24 @@ def _vad_segments(audio_bytes: bytes, sample_rate_hz: int, *, max_vad_segment_se
     if not chunks:
         chunks = [VADChunk(0, len(samples))]
 
-    return _postprocess_vad_chunks(chunks, len(samples), sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+    return _postprocess_vad_chunks(
+        chunks,
+        samples,
+        len(samples),
+        sample_rate_hz,
+        profile=profile,
+        max_vad_segment_seconds=max_vad_segment_seconds,
+    )
 
 
-def _vad_segments_energy(samples: array, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
-    frame_ms = 30
-    frame_size = max(1, int(sample_rate_hz * frame_ms / 1000))
+def _vad_segments_energy(
+    samples: array,
+    sample_rate_hz: int,
+    *,
+    profile: VADProfile,
+    max_vad_segment_seconds: float,
+) -> list[VADChunk]:
+    frame_size = max(1, int(sample_rate_hz * profile.frame_ms / 1000))
     energies: list[float] = []
     frame_ranges: list[tuple[int, int]] = []
 
@@ -575,9 +627,7 @@ def _vad_segments_energy(samples: array, sample_rate_hz: int, *, max_vad_segment
         energies.append(energy)
         frame_ranges.append((frame_start, frame_end))
 
-    sorted_energy = sorted(energies)
-    noise_floor = sorted_energy[max(0, int(len(sorted_energy) * 0.2) - 1)] if sorted_energy else 0.0
-    threshold = max(250.0, noise_floor * 3.0)
+    threshold = _adaptive_energy_threshold(energies, profile.energy_threshold)
 
     chunks: list[VADChunk] = []
     in_speech = False
@@ -593,7 +643,7 @@ def _vad_segments_energy(samples: array, sample_rate_hz: int, *, max_vad_segment
 
         if in_speech:
             silence_frames += 1
-            if silence_frames >= 8:
+            if silence_frames >= profile.silence_limit_frames:
                 speech_end = frame_ranges[idx][1]
                 chunks.append(VADChunk(speech_start, speech_end))
                 in_speech = False
@@ -604,30 +654,413 @@ def _vad_segments_energy(samples: array, sample_rate_hz: int, *, max_vad_segment
     if not chunks:
         chunks = [VADChunk(0, len(samples))]
 
-    return _postprocess_vad_chunks(chunks, len(samples), sample_rate_hz, max_vad_segment_seconds=max_vad_segment_seconds)
+    return _postprocess_vad_chunks(
+        chunks,
+        samples,
+        len(samples),
+        sample_rate_hz,
+        profile=profile,
+        max_vad_segment_seconds=max_vad_segment_seconds,
+    )
 
 
-def _postprocess_vad_chunks(chunks: list[VADChunk], sample_count: int, sample_rate_hz: int, *, max_vad_segment_seconds: float) -> list[VADChunk]:
+def _postprocess_vad_chunks(
+    chunks: list[VADChunk],
+    samples: array,
+    sample_count: int,
+    sample_rate_hz: int,
+    *,
+    profile: VADProfile,
+    max_vad_segment_seconds: float,
+) -> list[VADChunk]:
+    if not chunks:
+        return []
+
+    chunk_stats = _summarize_vad_chunk_stats(chunks, sample_rate_hz)
+    pad_seconds = _adaptive_pad_seconds(profile.pad_seconds, chunk_stats)
+    merge_gap_seconds = _adaptive_merge_gap_seconds(profile.merge_gap_seconds, chunk_stats)
+    sentence_pause_seconds = _sentence_boundary_seconds(chunk_stats)
+    pad = int(pad_seconds * sample_rate_hz)
+
     padded: list[VADChunk] = []
-    pad = int(0.15 * sample_rate_hz)
     for chunk in chunks:
         start = max(0, chunk.start_sample - pad)
         end = min(sample_count, chunk.end_sample + pad)
-        if padded and start <= padded[-1].end_sample + int(0.2 * sample_rate_hz):
-            padded[-1].end_sample = max(padded[-1].end_sample, end)
+        candidate = VADChunk(start, end)
+        if padded and _should_merge_vad_chunks(
+            padded[-1],
+            chunk,
+            sample_rate_hz,
+            merge_gap_seconds=merge_gap_seconds,
+            sentence_pause_seconds=sentence_pause_seconds,
+        ):
+            padded[-1].end_sample = max(padded[-1].end_sample, candidate.end_sample)
         else:
-            padded.append(VADChunk(start, end))
+            padded.append(candidate)
 
     max_samples = max(int(max_vad_segment_seconds * sample_rate_hz), 1)
     split_chunks: list[VADChunk] = []
     for chunk in padded:
-        start = chunk.start_sample
-        while start < chunk.end_sample:
-            end = min(start + max_samples, chunk.end_sample)
-            split_chunks.append(VADChunk(start, end))
-            start = end
+        split_chunks.extend(
+            _split_chunk_on_energy_valleys(
+                chunk,
+                samples,
+                sample_rate_hz,
+                target_samples=max_samples,
+                chunk_stats=chunk_stats,
+            )
+        )
 
-    return split_chunks
+    return _rebalance_split_chunks(split_chunks, samples, sample_rate_hz, max_samples=max_samples, chunk_stats=chunk_stats)
+
+
+def _estimate_vad_profile(samples: array, sample_rate_hz: int) -> VADProfile:
+    frame_ms = 30
+    frame_size = max(1, int(sample_rate_hz * frame_ms / 1000))
+    energies: list[float] = []
+    for frame_start in range(0, len(samples), frame_size):
+        frame_end = min(frame_start + frame_size, len(samples))
+        frame = samples[frame_start:frame_end]
+        energies.append(sum(abs(v) for v in frame) / max(1, len(frame)))
+
+    if not energies:
+        return VADProfile()
+
+    noise_floor = _percentile(energies, 0.2)
+    speech_floor = _percentile(energies, 0.8)
+    peak_energy = max(energies)
+    activity_ratio = sum(1 for energy in energies if energy >= max(250.0, noise_floor * 2.0)) / len(energies)
+    dynamic_range = speech_floor / max(noise_floor, 1.0)
+    transition_density = _transition_density(energies, noise_floor, speech_floor)
+
+    if dynamic_range >= 7.0 and transition_density >= 0.18:
+        frame_ms = 20
+    elif dynamic_range <= 2.5 and activity_ratio < 0.25:
+        frame_ms = 30
+    elif transition_density >= 0.28 and peak_energy > noise_floor * 8.0:
+        frame_ms = 20
+
+    if dynamic_range >= 8.0:
+        webrtc_mode = 0
+    elif dynamic_range >= 5.0:
+        webrtc_mode = 1
+    elif dynamic_range >= 3.0:
+        webrtc_mode = 2
+    else:
+        webrtc_mode = 3
+
+    silence_seconds = _clamp(0.16, 0.45, 0.22 + (0.45 - min(activity_ratio, 0.45)) * 0.35 + (4.0 / max(dynamic_range, 1.0)) * 0.03)
+    pad_seconds = _clamp(0.08, 0.28, 0.14 + (0.35 - min(activity_ratio, 0.35)) * 0.18 + (3.0 / max(dynamic_range, 1.0)) * 0.02)
+    merge_gap_seconds = _clamp(0.12, 0.35, 0.18 + (0.3 - min(activity_ratio, 0.3)) * 0.18 - (transition_density * 0.08))
+    energy_threshold = _adaptive_energy_threshold(energies, 250.0)
+
+    silence_limit_frames = max(1, int(round(silence_seconds * 1000 / frame_ms)))
+    return VADProfile(
+        frame_ms=frame_ms,
+        webrtc_mode=webrtc_mode,
+        silence_limit_frames=silence_limit_frames,
+        energy_threshold=energy_threshold,
+        pad_seconds=pad_seconds,
+        merge_gap_seconds=merge_gap_seconds,
+    )
+
+
+
+def _adaptive_energy_threshold(energies: list[float], default_threshold: float) -> float:
+    if not energies:
+        return default_threshold
+
+    noise_floor = _percentile(energies, 0.2)
+    speech_floor = _percentile(energies, 0.8)
+    if noise_floor <= 0.0:
+        return default_threshold
+
+    dynamic_range = speech_floor / max(noise_floor, 1.0)
+    if dynamic_range >= 8.0:
+        multiplier = 2.0
+    elif dynamic_range >= 5.0:
+        multiplier = 2.4
+    elif dynamic_range >= 3.0:
+        multiplier = 3.0
+    else:
+        multiplier = 3.6
+    return max(default_threshold, noise_floor * multiplier)
+
+
+
+def _transition_density(energies: list[float], noise_floor: float, speech_floor: float) -> float:
+    if not energies:
+        return 0.0
+    midpoint = max(250.0, (noise_floor + speech_floor) / 2.0)
+    transitions = 0
+    previous = energies[0] >= midpoint
+    for energy in energies[1:]:
+        current = energy >= midpoint
+        if current != previous:
+            transitions += 1
+        previous = current
+    return transitions / max(1, len(energies) - 1)
+
+
+
+def _summarize_vad_chunk_stats(chunks: list[VADChunk], sample_rate_hz: int) -> VADChunkStats:
+    durations = [max(0.0, (chunk.end_sample - chunk.start_sample) / sample_rate_hz) for chunk in chunks if chunk.end_sample > chunk.start_sample]
+    if not durations:
+        return VADChunkStats(chunk_count=len(chunks), median_duration_seconds=0.0, median_gap_seconds=0.0, short_chunk_ratio=0.0, span_seconds=0.0)
+
+    gaps: list[float] = []
+    for left, right in zip(chunks, chunks[1:]):
+        gap = (right.start_sample - left.end_sample) / sample_rate_hz
+        if gap > 0.0:
+            gaps.append(gap)
+
+    median_duration = _median(durations)
+    median_gap = _median(gaps) if gaps else 0.0
+    short_chunk_ratio = sum(1 for duration in durations if duration <= max(0.6, median_duration * 0.65)) / len(durations)
+    span_seconds = max(0.0, (chunks[-1].end_sample - chunks[0].start_sample) / sample_rate_hz)
+    return VADChunkStats(
+        chunk_count=len(durations),
+        median_duration_seconds=median_duration,
+        median_gap_seconds=median_gap,
+        short_chunk_ratio=short_chunk_ratio,
+        span_seconds=span_seconds,
+    )
+
+
+
+def _adaptive_pad_seconds(base_pad_seconds: float, stats: VADChunkStats) -> float:
+    pad = base_pad_seconds
+    if stats.chunk_count <= 1:
+        return pad
+    if stats.median_duration_seconds <= 0.55:
+        pad += 0.06
+    elif stats.median_duration_seconds >= 2.5:
+        pad -= 0.03
+    if stats.short_chunk_ratio >= 0.5:
+        pad += 0.04
+    if stats.median_gap_seconds > 0.0 and stats.median_gap_seconds <= 0.18:
+        pad += 0.02
+    return _clamp(0.08, 0.3, pad)
+
+
+
+def _adaptive_merge_gap_seconds(base_merge_gap_seconds: float, stats: VADChunkStats) -> float:
+    merge_gap = base_merge_gap_seconds
+    if stats.chunk_count <= 1:
+        return merge_gap
+    if stats.median_gap_seconds > 0.0:
+        merge_gap = min(merge_gap, stats.median_gap_seconds * 0.9)
+    if stats.short_chunk_ratio >= 0.45:
+        merge_gap += 0.03
+    if stats.median_duration_seconds >= 2.0 and stats.median_gap_seconds >= 0.25:
+        merge_gap -= 0.02
+    return _clamp(0.12, 0.36, merge_gap)
+
+
+
+def _sentence_boundary_seconds(stats: VADChunkStats) -> float:
+    if stats.chunk_count <= 1:
+        return 0.24
+    baseline = max(stats.median_gap_seconds * 1.35, stats.median_duration_seconds * 0.14, 0.22)
+    if stats.short_chunk_ratio >= 0.5:
+        baseline += 0.04
+    if stats.median_duration_seconds >= 2.0:
+        baseline += 0.03
+    return _clamp(0.2, 0.52, baseline)
+
+
+
+def _should_merge_vad_chunks(
+    left: VADChunk,
+    right: VADChunk,
+    sample_rate_hz: int,
+    *,
+    merge_gap_seconds: float,
+    sentence_pause_seconds: float,
+) -> bool:
+    gap_seconds = max(0.0, (right.start_sample - left.end_sample) / sample_rate_hz)
+    if gap_seconds > merge_gap_seconds:
+        return False
+    if gap_seconds >= sentence_pause_seconds:
+        return False
+
+    left_duration = max(0.0, (left.end_sample - left.start_sample) / sample_rate_hz)
+    right_duration = max(0.0, (right.end_sample - right.start_sample) / sample_rate_hz)
+    if gap_seconds >= 0.14 and left_duration >= 1.4 and right_duration >= 1.4:
+        return False
+    if gap_seconds >= 0.12 and (left_duration >= 2.0 or right_duration >= 2.0):
+        return False
+    return True
+
+
+
+def _split_chunk_on_energy_valleys(
+    chunk: VADChunk,
+    samples: array,
+    sample_rate_hz: int,
+    *,
+    target_samples: int,
+    chunk_stats: VADChunkStats,
+) -> list[VADChunk]:
+    if chunk.end_sample <= chunk.start_sample:
+        return []
+
+    duration = chunk.end_sample - chunk.start_sample
+    if duration <= target_samples:
+        return [chunk]
+
+    split_point = _find_chunk_energy_valley(chunk, samples, sample_rate_hz, target_samples=target_samples, chunk_stats=chunk_stats)
+    if split_point is None:
+        return [chunk]
+
+    left = VADChunk(chunk.start_sample, split_point)
+    right = VADChunk(split_point, chunk.end_sample)
+    min_side = max(int(sample_rate_hz * 0.65), int(target_samples * 0.28))
+    if (left.end_sample - left.start_sample) < min_side or (right.end_sample - right.start_sample) < min_side:
+        return [chunk]
+
+    return _split_chunk_on_energy_valleys(left, samples, sample_rate_hz, target_samples=target_samples, chunk_stats=chunk_stats) + _split_chunk_on_energy_valleys(right, samples, sample_rate_hz, target_samples=target_samples, chunk_stats=chunk_stats)
+
+
+
+def _find_chunk_energy_valley(
+    chunk: VADChunk,
+    samples: array,
+    sample_rate_hz: int,
+    *,
+    target_samples: int,
+    chunk_stats: VADChunkStats,
+) -> int | None:
+    span = chunk.end_sample - chunk.start_sample
+    if span <= target_samples:
+        return None
+
+    min_side = max(int(sample_rate_hz * 0.65), int(target_samples * 0.35))
+    search_start = chunk.start_sample + min_side
+    search_end = chunk.end_sample - min_side
+    if search_end <= search_start:
+        return None
+
+    window_samples = max(int(sample_rate_hz * 0.08), int(target_samples * 0.08))
+    window_samples = min(window_samples, max(int(sample_rate_hz * 0.18), 1))
+    hop_samples = max(1, window_samples // 2)
+
+    energies: list[float] = []
+    centers: list[int] = []
+    for center in range(search_start, search_end + 1, hop_samples):
+        win_start = max(chunk.start_sample, center - window_samples // 2)
+        win_end = min(chunk.end_sample, win_start + window_samples)
+        if win_end - win_start < max(1, window_samples // 2):
+            continue
+        energy = _window_energy(samples, win_start, win_end)
+        energies.append(energy)
+        centers.append((win_start + win_end) // 2)
+
+    if len(energies) < 3:
+        return None
+
+    median_energy = _median(energies)
+    low_energy = _percentile(energies, 0.25)
+    activity_bias = 1.0 + min(0.25, chunk_stats.short_chunk_ratio * 0.15)
+    threshold = min(median_energy * 0.72, low_energy * activity_bias)
+    best_idx = min(range(len(energies)), key=lambda idx: (energies[idx], abs(centers[idx] - (chunk.start_sample + chunk.end_sample) // 2)))
+    if energies[best_idx] > threshold:
+        return None
+
+    return centers[best_idx]
+
+
+
+def _rebalance_split_chunks(
+    chunks: list[VADChunk],
+    samples: array,
+    sample_rate_hz: int,
+    *,
+    max_samples: int,
+    chunk_stats: VADChunkStats,
+) -> list[VADChunk]:
+    if len(chunks) <= 1:
+        return chunks
+
+    rebalance_gap_seconds = _clamp(0.08, 0.24, max(0.1, chunk_stats.median_gap_seconds * 0.8 if chunk_stats.median_gap_seconds > 0.0 else 0.14))
+    min_short_seconds = max(0.45, chunk_stats.median_duration_seconds * 0.42)
+    merged: list[VADChunk] = [chunks[0]]
+
+    for current in chunks[1:]:
+        previous = merged[-1]
+        gap_seconds = max(0.0, (current.start_sample - previous.end_sample) / sample_rate_hz)
+        previous_duration = (previous.end_sample - previous.start_sample) / sample_rate_hz
+        current_duration = (current.end_sample - current.start_sample) / sample_rate_hz
+        should_merge = False
+
+        if gap_seconds <= rebalance_gap_seconds:
+            valley_energy = _window_energy(samples, previous.end_sample, current.start_sample)
+            left_energy = _window_energy(samples, max(previous.start_sample, previous.end_sample - int(sample_rate_hz * 0.12)), previous.end_sample)
+            right_energy = _window_energy(samples, current.start_sample, min(current.end_sample, current.start_sample + int(sample_rate_hz * 0.12)))
+            surrounding_energy = min(left_energy, right_energy) if left_energy and right_energy else max(left_energy, right_energy)
+            valley_ratio = valley_energy / max(surrounding_energy, 1.0)
+            if valley_ratio >= 0.82:
+                should_merge = True
+            elif min(previous_duration, current_duration) <= min_short_seconds and gap_seconds <= rebalance_gap_seconds * 1.2:
+                should_merge = True
+
+        if should_merge:
+            previous.end_sample = max(previous.end_sample, current.end_sample)
+            continue
+
+        merged.append(current)
+
+    balanced: list[VADChunk] = []
+    for chunk in merged:
+        if (chunk.end_sample - chunk.start_sample) > max_samples * 1.15:
+            balanced.extend(
+                _split_chunk_on_energy_valleys(
+                    chunk,
+                    samples,
+                    sample_rate_hz,
+                    target_samples=max_samples,
+                    chunk_stats=chunk_stats,
+                )
+            )
+        else:
+            balanced.append(chunk)
+
+    return balanced
+
+
+
+def _window_energy(samples: array, start_sample: int, end_sample: int) -> float:
+    if end_sample <= start_sample:
+        return 0.0
+    frame = samples[start_sample:end_sample]
+    return sum(abs(v) for v in frame) / max(1, len(frame))
+
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+
+def _percentile(values: list[float], ratio: float) -> float:
+    if not values:
+        return 0.0
+    ratio = min(max(ratio, 0.0), 1.0)
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round((len(ordered) - 1) * ratio))))
+    return ordered[index]
+
+
+
+def _clamp(lower: float, upper: float, value: float) -> float:
+    return max(lower, min(upper, value))
+
 
 
 def _build_packed_audio_batches(
@@ -686,6 +1119,28 @@ def _build_packed_audio_batches(
     return batches
 
 
+_PACKED_TIME_TOLERANCE_SECONDS = 0.1
+
+
+def _placement_at_time(value: float | None, placements: list[PackedPlacement]) -> tuple[int, PackedPlacement] | None:
+    if value is None:
+        return None
+    for index, placement in enumerate(placements):
+        lower = placement.packed_start - _PACKED_TIME_TOLERANCE_SECONDS
+        upper = placement.packed_start + placement.duration + _PACKED_TIME_TOLERANCE_SECONDS
+        if lower <= value <= upper:
+            return index, placement
+    return None
+
+
+def _placement_index_for_segment(segment: Segment, placements: list[PackedPlacement]) -> int | None:
+    for value in (segment.start, segment.end):
+        matched = _placement_at_time(value, placements)
+        if matched is not None:
+            return matched[0]
+    return None
+
+
 def _map_word(word: WordTimestamp, placements: list[PackedPlacement]) -> WordTimestamp | None:
     mapped_start = _map_time(word.start, placements)
     mapped_end = _map_time(word.end, placements)
@@ -703,15 +1158,13 @@ def _map_segment(segment: Segment, placements: list[PackedPlacement]) -> Segment
 
 
 def _map_time(value: float | None, placements: list[PackedPlacement]) -> float | None:
-    if value is None:
+    matched = _placement_at_time(value, placements)
+    if matched is None:
         return None
-    for placement in placements:
-        lower = placement.packed_start
-        upper = placement.packed_start + placement.slot_duration
-        if lower <= value <= upper + 1e-6:
-            relative = min(max(0.0, value - placement.packed_start), placement.duration)
-            return placement.original_start + relative
-    return None
+    _, placement = matched
+    assert value is not None
+    relative = min(max(0.0, value - placement.packed_start), placement.duration)
+    return placement.original_start + relative
 
 
 def _speaker_label(speaker_tag: Any) -> str | None:
