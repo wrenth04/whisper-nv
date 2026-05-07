@@ -2,6 +2,7 @@
 set -eu
 
 PORT="${PORT:-8000}"
+UVICORN_WORKERS="${UVICORN_WORKERS:-4}"
 RIVA_MAX_MESSAGE_LENGTH="${RIVA_MAX_MESSAGE_LENGTH:-16777216}"
 FUNCTION_ID="${FUNCTION_ID:-b702f636-f60c-4a3d-a6f4-f3568c13bd7d}"
 RIVA_SERVER="${RIVA_SERVER:-grpc.nvcf.nvidia.com:443}"
@@ -15,4 +16,4 @@ export RIVA_SERVER
 export RIVA_USE_SSL
 export RIVA_MAX_MESSAGE_LENGTH
 
-exec uvicorn openai_server:app --host 0.0.0.0 --port "${PORT}"
+exec uvicorn openai_server:app --host 0.0.0.0 --port "${PORT}" --workers "${UVICORN_WORKERS}"
