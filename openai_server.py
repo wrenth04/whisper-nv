@@ -24,6 +24,7 @@ from audio_decode import AudioDecodeError, decode_to_pcm_s16le
 app = FastAPI(title="whisper-nv", version="0.1.0")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("whisper-nv")
+ASR_LOG_TIMINGS = os.getenv("ASR_LOG_TIMINGS", "false").lower() == "true"
 
 
 @app.middleware("http")
@@ -108,16 +109,19 @@ async def create_transcription(
     del prompt
     _check_auth(authorization)
 
+    handler_started = time.perf_counter()
     audio_bytes = await file.read()
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="Empty file")
 
     try:
+        decode_started = time.perf_counter()
         decoded_audio = decode_to_pcm_s16le(
             audio_bytes,
             filename=file.filename,
             content_type=file.content_type,
         )
+        decode_elapsed = time.perf_counter() - decode_started
     except AudioDecodeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -133,9 +137,12 @@ async def create_transcription(
     max_chunk_bytes = int(max_chunk_mb * 1024 * 1024)
     max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
 
+    split_started = time.perf_counter()
     chunks, offsets = split_pcm_by_size(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, max_chunk_bytes)
+    split_elapsed = time.perf_counter() - split_started
 
     try:
+        asr_started = time.perf_counter()
         partial_results = [
             client.transcribe_vad_packed(
                 chunk,
@@ -147,14 +154,31 @@ async def create_transcription(
             for chunk in chunks
         ]
         result = merge_transcription_results(partial_results, offsets)
+        asr_elapsed = time.perf_counter() - asr_started
     except RivaTranscriptionError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    postprocess_started = time.perf_counter()
     postprocess_options = PostProcessOptions(
         max_consecutive_phrase_repeats=max(1, int(os.getenv("ASR_MAX_CONSECUTIVE_PHRASE_REPEATS", "2"))),
         adjacent_segment_similarity_threshold=float(os.getenv("ASR_ADJ_DUPLICATE_SIMILARITY", "0.96")),
     )
     result = postprocess_transcription(result, postprocess_options)
+    postprocess_elapsed = time.perf_counter() - postprocess_started
+
+    if ASR_LOG_TIMINGS:
+        logger.info(
+            "transcription bytes=%d pcm_bytes=%d chunks=%d decode=%s split=%s asr=%s postprocess=%s total=%s format=%s",
+            len(audio_bytes),
+            len(decoded_audio.pcm_bytes),
+            len(chunks),
+            _format_elapsed(decode_elapsed),
+            _format_elapsed(split_elapsed),
+            _format_elapsed(asr_elapsed),
+            _format_elapsed(postprocess_elapsed),
+            _format_elapsed(time.perf_counter() - handler_started),
+            response_format,
+        )
 
     if response_format == "text":
         return PlainTextResponse(result.text)
