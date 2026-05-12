@@ -125,17 +125,17 @@ async def create_transcription(
     except AudioDecodeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    use_direct_riva = response_format in {"json", "text"}
     wants_verbose = response_format == "verbose_json"
     config_options = ASRConfigOptions(
         language_code=language,
         model_name=None if model == "whisper-1" else model,
-        word_time_offsets=wants_verbose or _wants_word_timestamps(timestamp_granularities),
+        word_time_offsets=wants_verbose or (not use_direct_riva and _wants_word_timestamps(timestamp_granularities)),
         no_verbatim_transcripts=os.getenv("ASR_NO_VERBATIM_TRANSCRIPTS", "true").lower() == "true",
     )
 
     max_chunk_mb = float(os.getenv("ASR_MAX_CHUNK_MB", "50"))
     max_chunk_bytes = int(max_chunk_mb * 1024 * 1024)
-    max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
 
     split_started = time.perf_counter()
     chunks, offsets = split_pcm_by_size(decoded_audio.pcm_bytes, decoded_audio.sample_rate_hz, max_chunk_bytes)
@@ -143,16 +143,29 @@ async def create_transcription(
 
     try:
         asr_started = time.perf_counter()
-        partial_results = [
-            client.transcribe_vad_packed(
-                chunk,
-                decoded_audio.sample_rate_hz,
-                config_options,
-                max_vad_segment_seconds=max_vad_segment_seconds,
-                max_request_bytes=max_chunk_bytes,
-            )
-            for chunk in chunks
-        ]
+        if use_direct_riva:
+            partial_results = [
+                client.transcribe_bytes(
+                    chunk,
+                    decoded_audio.sample_rate_hz,
+                    config_options,
+                )
+                for chunk in chunks
+            ]
+            asr_mode = "direct"
+        else:
+            max_vad_segment_seconds = float(os.getenv("ASR_VAD_MAX_SEGMENT_SECONDS", "10"))
+            partial_results = [
+                client.transcribe_vad_packed(
+                    chunk,
+                    decoded_audio.sample_rate_hz,
+                    config_options,
+                    max_vad_segment_seconds=max_vad_segment_seconds,
+                    max_request_bytes=max_chunk_bytes,
+                )
+                for chunk in chunks
+            ]
+            asr_mode = "vad_packed"
         result = merge_transcription_results(partial_results, offsets)
         asr_elapsed = time.perf_counter() - asr_started
     except RivaTranscriptionError as exc:
@@ -168,7 +181,7 @@ async def create_transcription(
 
     if ASR_LOG_TIMINGS:
         logger.info(
-            "transcription bytes=%d pcm_bytes=%d chunks=%d decode=%s split=%s asr=%s postprocess=%s total=%s format=%s",
+            "transcription bytes=%d pcm_bytes=%d chunks=%d decode=%s split=%s asr=%s postprocess=%s total=%s mode=%s format=%s",
             len(audio_bytes),
             len(decoded_audio.pcm_bytes),
             len(chunks),
@@ -177,6 +190,7 @@ async def create_transcription(
             _format_elapsed(asr_elapsed),
             _format_elapsed(postprocess_elapsed),
             _format_elapsed(time.perf_counter() - handler_started),
+            asr_mode,
             response_format,
         )
 
